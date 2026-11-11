@@ -445,7 +445,6 @@ td.num, th.num { text-align: right; }
   .foot-grid { grid-template-columns: 1fr; }
   .section { padding: 48px 0; }
   .map-card { top: auto; bottom: 16px; left: 12px; right: 12px; width: auto; padding: 16px; }
-  .map-card .info-list { display: none; }
   .map-page { min-height: 520px; }
 }
 @media (max-width: 560px) {
@@ -475,6 +474,17 @@ td.num, th.num { text-align: right; }
   :root { --surface: #fff; --surface-2: #f3f3f3; --border: #bbb; --border-soft: #ddd; --text: #000; --muted: #444; --gold-text: #6b4a00; --bg: #fff; --bg-2: #fff; }
   .card, .kpi, .table-card { break-inside: avoid; box-shadow: none; }
 }
+
+/* Tambahan: diskon, checkbox, kartu "segera hadir" */
+.disc { display: block; font-size: .68rem; font-weight: 600; color: var(--green); }
+.check { display: flex; gap: 10px; align-items: flex-start; font-size: .88rem; color: var(--text); cursor: pointer; }
+.check input { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--gold); flex-shrink: 0; }
+.dialog .hint, .card .hint { color: var(--muted); font-size: .78rem; }
+.shop-card.soon:hover { transform: none; border-color: var(--border-soft); }
+.sum b { white-space: nowrap; }
+
+.map-cta { position: absolute; left: max(20px, calc((100% - 1160px) / 2)); bottom: 36px; z-index: 2; box-shadow: var(--shadow); }
+@media (max-width: 560px) { .map-cta { left: 14px; right: 14px; bottom: 20px; } }
 
   </style>
   <script>
@@ -517,6 +527,8 @@ const SHOP_INFO = { owner: "Edy Kurniawan", address: "Jl. Raya Kumu, Rambah, Rok
 const MAP_QUERY = "Edy Kurniawan pangkas, Jl. Raya Kumu, Rambah, Rokan Hulu, Riau";
 const AGE_GROUPS = ["Anak-anak", "Remaja", "Dewasa"];
 const PAYMENTS = ["Tunai", "QRIS", "Transfer"];
+const CHILD_DISCOUNT = 5000; // potongan harga untuk kategori Anak-anak
+const ACTIVE_AREA = "Rambah Hilir"; // hanya wilayah ini yang sudah punya tempat pangkas
 const DEFAULT_SERVICES = [
   { id: "potong",  name: "Potong Rambut",            price: 20000, mins: 30 },
   { id: "pijat",   name: "Potong Rambut + Pijat",    price: 30000, mins: 40 },
@@ -525,7 +537,7 @@ const DEFAULT_SERVICES = [
   { id: "komplit", name: "Potong + Semir + Rapikan", price: 70000, mins: 90 },
   { id: "cukur",   name: "Cukur Jenggot",            price: 10000, mins: 15 },
 ];
-const DEFAULT_SETTINGS = { accepting: true, open: "09:00", close: "21:00", wa: "", chairs: 1, maxWaiting: 15 };
+const DEFAULT_SETTINGS = { accepting: true, open: "09:00", close: "21:00", wa: "", chairs: 1, maxWaiting: 15, autoWaCall: false };
 const DEMO_OWNER = { email: "pemilik@wber.shop", pass: "User123.com" };
 
 /* ===================== ALAT BANTU ===================== */
@@ -542,6 +554,8 @@ const fmtDur = (m) => (m >= 60 ? `${Math.floor(m / 60)} jam${m % 60 ? ` ${m % 60
 const ticketNo = (n) => "A" + pad(n, 3);
 const maskName = (n) => (n.length <= 2 ? n[0] + "•" : n.slice(0, 2) + "•".repeat(Math.min(4, n.length - 2)));
 const enc = encodeURIComponent;
+const maskPhone = (p) => (p && p.length > 6 ? p.slice(0, 4) + "••••" + p.slice(-3) : p || "");
+const hmToDate = (hm) => { const [h, m] = hm.split(":").map(Number); const d = new Date(); d.setHours(h, m, 0, 0); return d; };
 const WEEKDAYS = ["Min", "Sen", "Sel", "Rab", "Kam", "Jum", "Sab"];
 function ago(iso) {
   const m = Math.max(0, Math.round((Date.now() - new Date(iso)) / 60000));
@@ -657,6 +671,10 @@ async function initDb() {
   db.services ||= DEFAULT_SERVICES.map((s) => ({ ...s }));
   db.queue ||= []; db.history ||= []; db.mine ||= []; db.users ||= [];
   if (db.seqDay !== dayKey()) { db.seq = 0; db.seqDay = dayKey(); }
+  // Keamanan data: antrean basi (>24 jam) dihapus; nomor HP di riwayat disamarkan
+  db.queue = db.queue.filter((q) => Date.now() - new Date(q.createdAt) < 864e5);
+  db.mine = db.mine.filter((id) => db.queue.some((q) => q.id === id));
+  db.history.forEach((h) => { h.phone = maskPhone(h.phone || ""); });
   // Migrasi akun versi lama (kata sandi teks biasa) → disimpan sebagai hash
   const legacy = ls.get("wber_users");
   if (Array.isArray(legacy)) {
@@ -672,7 +690,31 @@ async function initDb() {
 /* ===================== LOGIKA ANTRIAN ===================== */
 const isOwner = () => session.role === "pemilik" && !!session.email;
 const svc = (id) => db.services.find((s) => s.id === id) || { id, name: "Layanan (dihapus)", price: 0, mins: 30 };
-const waiting = () => db.queue.filter((q) => q.status === "waiting");
+const qKey = (q) => q.sortKey ?? new Date(q.slot || q.createdAt).getTime();
+const waiting = () => db.queue.filter((q) => q.status === "waiting").sort((a, b) => qKey(a) - qKey(b));
+const priceFor = (sid, age) => Math.max(0, svc(sid).price - (age === "Anak-anak" ? CHILD_DISCOUNT : 0));
+const qPrice = (q) => priceFor(q.service, q.age);
+// Jam kedatangan yang bisa dipilih (kelipatan 15 menit, hari ini). "full" = kursi sudah terbooking.
+function slotOptions(sid) {
+  const s = svc(sid), now = new Date(), open = hmToDate(db.settings.open), close = hmToDate(db.settings.close);
+  const t = new Date(Math.max(now.getTime() + 10 * 60000, open.getTime()));
+  t.setMinutes(Math.ceil(t.getMinutes() / 15) * 15, 0, 0);
+  const out = [];
+  for (; t.getTime() + s.mins * 60000 <= close.getTime(); t.setTime(t.getTime() + 15 * 60000)) {
+    const a = t.getTime(), b = a + s.mins * 60000;
+    const clash = db.queue.filter((q) => { if (!q.slot) return false; const qa = new Date(q.slot).getTime(); return qa < b && qa + svc(q.service).mins * 60000 > a; }).length;
+    out.push({ hm: `${pad(t.getHours())}:${pad(t.getMinutes())}`, full: clash >= db.settings.chairs });
+  }
+  return out;
+}
+function ticketText(q) {
+  const s = svc(q.service), e = etaFor(q);
+  return [`*WberShop — Tiket Antrean*`, `No. antrean: *${q.no}*`, `Nama: ${q.name}`, `Layanan: ${s.name}`,
+    q.slot ? `Jadwal: ${fmtTime(q.slot)}` : `Estimasi mulai: ${e ? "±" + e + " menit" : "segera"}`,
+    `Biaya: ${rp(qPrice(q))}${q.age === "Anak-anak" ? ` (sudah termasuk diskon anak ${rp(CHILD_DISCOUNT)})` : ""}`,
+    `Tempat: ${ACTIVE_SHOP}, ${SHOP_INFO.address}`, `Pantau antrean: ${location.href.split("#")[0]}#${shopPath()}`, "",
+    "Mohon hadir maks. 10 menit setelah dipanggil. Terima kasih!"].join("\n");
+}
 const working = () => db.queue.filter((q) => q.status === "working");
 const isToday = (iso) => dayKey(new Date(iso)) === dayKey();
 const doneToday = () => db.history.filter((h) => h.status === "done" && isToday(h.endedAt));
@@ -703,7 +745,7 @@ function nextTicketNo() {
 }
 function toHistory(q, status, extra = {}) {
   const s = svc(q.service);
-  db.history.push({ id: q.id, no: q.no, name: q.name, age: q.age, service: q.service, serviceName: s.name, price: status === "done" ? s.price : 0, mins: s.mins, phone: q.phone, status, method: null, createdAt: q.createdAt, endedAt: new Date().toISOString(), ...extra });
+  db.history.push({ id: q.id, no: q.no, name: q.name, age: q.age, service: q.service, serviceName: s.name, price: status === "done" ? qPrice(q) : 0, discount: q.age === "Anak-anak" ? CHILD_DISCOUNT : 0, mins: s.mins, phone: maskPhone(q.phone), status, method: null, createdAt: q.createdAt, endedAt: new Date().toISOString(), ...extra });
 }
 function withinHours() {
   const n = new Date(), cur = n.getHours() * 60 + n.getMinutes();
@@ -740,7 +782,7 @@ let navCount = 0;
 const go = (path) => { location.hash = "#" + path; };
 const redirect = (path) => { location.replace("#" + path); };
 const shopPath = (tab) => `/shop/${enc(ACTIVE_SHOP)}${tab && tab !== "antrian" ? "/" + tab : ""}`;
-let lastArea = AREAS[1];
+let lastArea = ACTIVE_AREA;
 const mainEl = () => $("#main");
 
 function parseRoute() {
@@ -769,6 +811,7 @@ function render(opts = {}) {
     case "shop": {
       if (needRole()) return;
       if (p1 !== ACTIVE_SHOP) return redirect("/areas");
+      lastArea = ACTIVE_AREA;
       if (session.role === "pemilik" && !session.email) return redirect("/login");
       const allowed = isOwner() ? ["antrian", "layanan", "info", "riwayat", "pengaturan"] : ["antrian", "layanan", "info"];
       const tab = allowed.includes(p2) ? p2 : "antrian";
@@ -872,7 +915,7 @@ function viewSplash() {
   </section>
 
   <section class="section band" id="harga"><div class="container">
-    <div class="section-head"><span class="eyebrow">Layanan & harga</span><h2>Harga jelas, hasil rapi</h2></div>
+    <div class="section-head"><span class="eyebrow">Layanan & harga</span><h2>Harga jelas, hasil rapi</h2><p>Diskon anak-anak: potongan ${rp(CHILD_DISCOUNT)} untuk semua layanan.</p></div>
     <div class="price-grid">${db.services.map((s) => `
       <div class="price-card"><span class="nm">${esc(s.name)}</span><span class="pr">${rp(s.price)}</span><span class="mn">${icon("clock", 15)} ±${fmtDur(s.mins)}</span></div>`).join("")}</div>
   </div></section>
@@ -940,22 +983,10 @@ function viewAuth(register) {
 
 /* ---------- 4. Peta lokasi ---------- */
 function viewMap() {
-  const src = `https://maps.google.com/maps?q=${enc(MAP_QUERY)}&z=17&output=embed`;
+  const src = `https://maps.google.com/maps?q=${enc(MAP_QUERY)}&t=&z=17&ie=UTF8&iwloc=B&output=embed`;
   return `<section class="map-page">
     <iframe title="Peta lokasi Bengkel Pangkas ${esc(SHOP_INFO.owner)}" src="${src}" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allowfullscreen></iframe>
-    <div class="map-card">
-      <div class="top"><img src="${A.pangkas}" alt="Logo Bengkel Pangkas Edy Kurniawan" />
-        <div><span class="badge ${db.settings.accepting ? "open" : "closed"}"><span class="dot"></span>${db.settings.accepting ? "Antrian dibuka" : "Antrian ditutup"}</span>
-          <h1>Bengkel Pangkas ${esc(SHOP_INFO.owner)}</h1></div></div>
-      <ul class="info-list">
-        <li>${icon("pin", 16)}<b>${esc(SHOP_INFO.address)}</b></li>
-        <li>${icon("clock", 16)}<b>Buka ${esc(db.settings.open)} – ${esc(db.settings.close)}</b></li>
-        <li>${icon("users", 16)}<b>${db.queue.length} orang dalam antrian</b></li></ul>
-      <div class="btns">
-        <a class="btn btn-ghost btn-sm" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${enc(MAP_QUERY)}">${icon("nav", 15)} Petunjuk arah</a>
-        <a class="btn btn-ghost btn-sm" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=${enc(MAP_QUERY)}">${icon("pin", 15)} Google Maps</a>
-        <a class="btn btn-primary" href="#/areas">Pilih Lokasi ${icon("right", 16)}</a></div>
-    </div>
+    <a class="btn btn-primary btn-lg map-cta" href="#/areas">Pilih Lokasi ${icon("right", 16)}</a>
   </section>`;
 }
 
@@ -967,13 +998,23 @@ function viewAreas() {
       <label class="search">${icon("search", 16)}<input type="search" data-filter placeholder="Cari wilayah…" aria-label="Cari wilayah" /></label></div>
     <div class="choice-grid">${AREAS.map((a) => `
       <a class="choice" data-search="${esc(a.toLowerCase())}" href="#/shops/${enc(a)}">
-        <span class="ico">${icon("pin", 22)}</span><span class="tx"><b>${esc(a)}</b><small>${SHOPS.length} tempat pangkas</small></span><span class="arrow">${icon("right", 20)}</span></a>`).join("")}</div>
+        <span class="ico">${icon("pin", 22)}</span><span class="tx"><b>${esc(a)}</b><small>${a === ACTIVE_AREA ? `${SHOPS.length} tempat pangkas` : "Akan segera hadir"}</small></span><span class="arrow">${icon("right", 20)}</span></a>`).join("")}</div>
     <p class="empty" id="no-result" hidden>Tidak ada hasil.</p>
   </div>`;
 }
 
 /* ---------- 6. Tempat pangkas ---------- */
+function viewSoon(area) {
+  return `<div class="container page">
+    <button class="back-link" data-action="back">${icon("left", 16)} Kembali</button>
+    <div class="page-head"><div><h1>Tempat pangkas di ${esc(area)}</h1><p>Toko di wilayah ini belum tersedia.</p></div></div>
+    <div class="shop-list"><div class="shop-card soon">
+      <div class="cover">${icon("scissors", 44)}<span class="badge soon">Segera hadir</span></div>
+      <div class="body"><h3>Akan segera hadir</h3><div class="meta"><span>${icon("info", 15)} Belum ada tempat pangkas di wilayah ini</span></div></div></div></div>
+  </div>`;
+}
 function viewShops(area) {
+  if (area !== ACTIVE_AREA) return viewSoon(area);
   return `<div class="container page">
     <button class="back-link" data-action="back">${icon("left", 16)} Kembali</button>
     <div class="page-head"><div><h1>Tempat pangkas di ${esc(area)}</h1><p>Hanya toko dengan antrian online yang dapat dibuka.</p></div>
@@ -1028,10 +1069,10 @@ function viewDashboard(tab) {
 function card(q, owner) {
   const s = svc(q.service), mineQ = db.mine.includes(q.id), mins = etaFor(q);
   const statusBadge = q.status === "working" ? `<span class="badge working">${icon("scissors", 12)} Dikerjakan</span>` : `<span class="badge">Menunggu</span>`;
-  const eta = q.status === "waiting" ? `<span>${icon("clock", 14)} ${mins ? `Mulai ±${mins} mnt lagi` : "Giliran berikutnya"}</span>` : `<span>${icon("clock", 14)} Mulai ${fmtTime(q.startedAt || q.createdAt)}</span>`;
+  const eta = q.status === "waiting" ? `<span>${icon("clock", 14)} ${q.slot ? `Jadwal ${fmtTime(q.slot)}` : mins ? `Mulai ±${mins} mnt lagi` : "Giliran berikutnya"}</span>` : `<span>${icon("clock", 14)} Mulai ${fmtTime(q.startedAt || q.createdAt)}</span>`;
   let acts = "";
   if (owner) {
-    const wa = `<a class="btn btn-ghost btn-sm" target="_blank" rel="noopener" href="${waLink(q.phone, `Halo ${q.name}, ini WberShop. Nomor antrean Anda ${q.no}. ${q.status === "waiting" ? "Mohon bersiap, giliran Anda segera tiba." : "Giliran Anda sedang berlangsung."}`)}">${icon("chat", 14)} WhatsApp</a>`;
+    const wa = `<a class="btn btn-ghost btn-sm" target="_blank" rel="noopener" href="${waLink(q.phone, `Halo ${q.name}, ${q.status === "waiting" ? "giliran Anda segera tiba. Mohon bersiap." : "giliran Anda sedang berlangsung."}\n\n${ticketText(q)}`)}">${icon("chat", 14)} WhatsApp</a>`;
     acts = q.status === "waiting"
       ? `<button class="btn btn-primary btn-sm" data-action="call" data-id="${q.id}">${icon("play", 14)} Panggil</button><button class="btn btn-ghost btn-sm" data-action="skip" data-id="${q.id}">${icon("skip", 14)} Lewati</button>${wa}<button class="btn btn-danger btn-sm" data-action="cancel" data-id="${q.id}">${icon("x", 14)} Batalkan</button>`
       : `<button class="btn btn-primary btn-sm" data-action="finish" data-id="${q.id}">${icon("check", 14)} Selesai</button>${wa}<button class="btn btn-danger btn-sm" data-action="cancel" data-id="${q.id}">${icon("x", 14)} Batalkan</button>`;
@@ -1042,8 +1083,8 @@ function card(q, owner) {
   return `<div class="qcard ${q.status}${mineQ ? " mine" : ""}" data-search="${esc((q.name + " " + q.no + " " + s.name).toLowerCase())}">
     <div class="tk">${esc(q.no)}</div>
     <div><div class="nm">${esc(shown)} <span class="age">${esc(q.age)}</span>${mineQ ? `<span class="you">Anda</span>` : ""}</div>
-      <div class="meta"><span>${icon("scissors", 14)} ${esc(s.name)}</span><span>${icon("clock", 14)} ${fmtDur(s.mins)}</span>${eta}${owner ? `<span>${icon("phone", 14)} ${esc(q.phone)}</span>` : ""}</div></div>
-    <div class="right">${statusBadge}<span class="price">${rp(s.price)}</span></div>
+      <div class="meta"><span>${icon("scissors", 14)} ${esc(s.name)}</span><span>${icon("clock", 14)} ${fmtDur(s.mins)}</span>${eta}${owner ? `<span>${icon("phone", 14)} ${esc(maskPhone(q.phone))}</span>` : ""}</div></div>
+    <div class="right">${statusBadge}<span class="price">${rp(qPrice(q))}${q.age === "Anak-anak" ? `<small class="disc">diskon anak</small>` : ""}</span></div>
     ${acts ? `<div class="q-actions">${acts}</div>` : ""}</div>`;
 }
 
@@ -1062,11 +1103,12 @@ function ticketCard(q) {
       <span class="badge ${q.status === "working" ? "working" : ""}">${q.status === "working" ? "Dikerjakan" : "Menunggu"}</span></div>
     <div class="t-msg">${st.title}</div><div class="t-sub">${st.text}</div>
     <div class="t-stats">
-      <div><small>Estimasi mulai</small><b>${q.status === "working" ? "Sekarang" : mins ? "±" + mins + " mnt" : "Segera"}</b></div>
+      ${q.slot ? `<div><small>Jadwal Anda</small><b>${fmtTime(q.slot)}</b></div>` : `<div><small>Estimasi mulai</small><b>${q.status === "working" ? "Sekarang" : mins ? "±" + mins + " mnt" : "Segera"}</b></div>`}
       <div><small>Layanan</small><b style="font-size:1rem;font-family:var(--font-body)">${esc(s.name)}</b></div>
-      <div><small>Biaya</small><b>${rpK(s.price)}</b></div></div>
+      <div><small>Biaya</small><b>${rpK(qPrice(q))}</b></div></div>
     <div class="progress" aria-label="Progres antrean"><div class="on">Menunggu</div><div class="${st.step >= 1 ? "on" : ""}">Giliran berikutnya</div><div class="${st.step >= 2 ? "on" : ""}">Dikerjakan</div></div>
     <div class="btns">
+      <a class="btn btn-primary btn-sm" target="_blank" rel="noopener" href="${waLink(q.phone, ticketText(q))}">${icon("chat", 14)} Kirim tiket ke WhatsApp saya</a>
       ${!notifOk && "Notification" in window ? `<button class="btn btn-outline btn-sm" data-action="notif">${icon("bell", 14)} Aktifkan pengingat</button>` : ""}
       ${db.settings.wa ? `<a class="btn btn-ghost btn-sm" target="_blank" rel="noopener" href="${waLink(db.settings.wa, `Halo, saya ${q.name} (tiket ${q.no}).`)}">${icon("chat", 14)} Hubungi toko</a>` : ""}
       ${q.status === "waiting" ? `<button class="btn btn-danger btn-sm" data-action="cancel" data-id="${q.id}">Batalkan</button>` : ""}</div></div>`;
@@ -1095,7 +1137,7 @@ function tabAntrian() {
     ${!owner ? (mineQ ? ticketCard(mineQ) : `<div class="card cta-card"><div class="ico">${icon("ticket", 26)}</div><h3>Ambil nomor antrean</h3>
         <p>${db.settings.accepting ? `Estimasi tunggu saat ini ${etaNew() ? "±" + etaNew() + " menit" : "— langsung dilayani"}.` : "Antrian sedang ditutup. Silakan kembali lagi nanti."}</p>
         <button class="btn btn-primary btn-lg" data-action="openCheckin" ${db.settings.accepting ? "" : "disabled"}>DAFTAR</button></div>`) : ""}
-    <div class="card"><h3>Harga layanan</h3><ul class="mini-price">${popular.map((s) => `<li><span>${esc(s.name)}</span><b>${rpK(s.price)}</b></li>`).join("")}</ul>
+    <div class="card"><h3>Harga layanan</h3><p style="color:var(--muted);font-size:.8rem;margin:-6px 0 12px">Anak-anak: potongan ${rp(CHILD_DISCOUNT)}</p><ul class="mini-price">${popular.map((s) => `<li><span>${esc(s.name)}</span><b>${rpK(s.price)}</b></li>`).join("")}</ul>
       <a class="btn btn-ghost btn-sm btn-block" style="margin-top:14px" href="#${shopPath("layanan")}">Lihat semua layanan</a></div>
     ${owner ? "" : `<div class="card"><h3>Jam operasional</h3><p style="color:var(--muted);font-size:.9rem">${esc(db.settings.open)} – ${esc(db.settings.close)}<br>Harap hadir maks. 10 menit setelah dipanggil.</p></div>`}
   </aside>`;
@@ -1107,6 +1149,7 @@ function tabLayanan() {
   const owner = isOwner();
   return `<div class="toolbar"><div><h2 style="font-family:var(--font-display)">Daftar layanan</h2><p style="color:var(--muted);font-size:.9rem">${db.services.length} layanan tersedia</p></div>
       ${owner ? `<button class="btn btn-primary" data-action="editService">${icon("plus", 16)} Tambah layanan</button>` : ""}</div>
+    <p class="form-note" style="margin-bottom:16px">Diskon anak-anak: potongan ${rp(CHILD_DISCOUNT)} untuk semua layanan.</p>
     <div class="svc-grid">${db.services.map((s) => `<div class="svc-card"><span class="nm">${esc(s.name)}</span><span class="pr">${rp(s.price)}</span>
       <span class="mn">${icon("clock", 15)} ±${fmtDur(s.mins)}</span>
       <div class="acts">${owner
@@ -1128,7 +1171,10 @@ function tabInfo() {
     <div class="card"><h3 style="font-size:1rem;margin-bottom:10px">Ketentuan antrean</h3>
       <ul class="info-list"><li>${icon("check", 16)}<b>Satu perangkat hanya dapat memiliki satu antrean aktif.</b></li>
         <li>${icon("check", 16)}<b>Hadir maksimal 10 menit setelah dipanggil, atau antrean dapat dilewati.</b></li>
-        <li>${icon("check", 16)}<b>Estimasi waktu bersifat perkiraan dan dapat berubah.</b></li></ul></div></div>
+        <li>${icon("check", 16)}<b>Estimasi waktu bersifat perkiraan dan dapat berubah.</b></li>
+        <li>${icon("check", 16)}<b>Anak-anak mendapat potongan ${rp(CHILD_DISCOUNT)} untuk semua layanan.</b></li>
+        <li>${icon("shield", 16)}<b>Nomor HP hanya dipakai untuk antrean dan notifikasi tiket, tidak terlihat oleh pelanggan lain, dan disamarkan di riwayat.</b></li></ul>
+      ${isOwner() ? "" : `<button class="btn btn-ghost btn-sm" style="margin-top:14px" data-action="forgetMe">${icon("trash", 14)} Hapus data saya di perangkat ini</button>`}</div></div>
     <aside class="side"><div class="card" style="padding:0;overflow:hidden"><img src="${A.map}" alt="Peta lokasi toko" style="width:100%;aspect-ratio:1;object-fit:cover" />
       <div style="padding:16px;display:grid;gap:10px"><a class="btn btn-primary btn-block" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${enc(MAP_QUERY)}">${icon("nav", 16)} Petunjuk arah</a>
       <a class="btn btn-ghost btn-block" href="#/map">Lihat peta lengkap</a></div></div></aside></div>`;
@@ -1196,6 +1242,7 @@ function tabPengaturan() {
       <div class="row-2"><div class="field"><label for="s-chairs">Jumlah kursi pangkas</label><input id="s-chairs" type="number" min="1" max="6" value="${s.chairs}" /></div>
         <div class="field"><label for="s-max">Maks. antrean menunggu</label><input id="s-max" type="number" min="1" max="99" value="${s.maxWaiting}" /></div></div>
       <div class="field"><label for="s-wa">Nomor WhatsApp toko</label><input id="s-wa" type="tel" inputmode="numeric" value="${esc(s.wa)}" placeholder="081234567890" /><span class="hint">Opsional. Ditampilkan sebagai tombol “Hubungi toko” untuk pelanggan.</span><span class="err" data-err="wa"></span></div>
+      <label class="check"><input type="checkbox" id="s-autowa" ${s.autoWaCall ? "checked" : ""} /><span>Buka WhatsApp otomatis saat memanggil pelanggan (pesan “giliran Anda sekarang”)</span></label>
       <button class="btn btn-primary" type="submit">Simpan pengaturan</button></form>
     <form class="card form" data-form="password" novalidate>
       <div><h3>Ganti kata sandi</h3><p class="sub">Akun: ${esc(session.email)}</p></div>
@@ -1269,7 +1316,7 @@ const actions = {
   call: (d) => setStatus(Number(d.id), "working"),
   skip: (d) => {
     const q = db.queue.find((x) => x.id === Number(d.id)); if (!q) return;
-    db.queue = db.queue.filter((x) => x !== q); db.queue.push(q); save(); render({ keep: true });
+    q.sortKey = Math.max(...waiting().map(qKey)) + 1; save(); render({ keep: true });
     toast(`${q.name} dipindah ke urutan terakhir.`);
   },
   finish: (d) => openFinish(Number(d.id)),
@@ -1290,6 +1337,7 @@ const actions = {
   confirmDelService: (d) => { db.services = db.services.filter((s) => s.id !== d.id); save(); closeModal(); render({ keep: true }); toast("Layanan dihapus.", "success"); },
   confirmCancel: (d) => {
     const q = db.queue.find((x) => x.id === Number(d.id)); if (!q) return closeModal();
+    if (!isOwner() && !db.mine.includes(q.id)) { closeModal(); return toast("Anda hanya dapat membatalkan antrean milik sendiri.", "error"); }
     toHistory(q, "cancelled", { by: isOwner() ? "pemilik" : "pelanggan" });
     db.queue = db.queue.filter((x) => x !== q); db.mine = db.mine.filter((x) => x !== q.id);
     save(); closeModal(); render({ keep: true }); toast(`Antrean ${q.name} dibatalkan.`);
@@ -1299,7 +1347,7 @@ const actions = {
     const method = ($("input[name=pay]:checked") || {}).value || "Tunai";
     toHistory(q, "done", { method });
     db.queue = db.queue.filter((x) => x !== q); db.mine = db.mine.filter((x) => x !== q.id);
-    save(); closeModal(); render({ keep: true }); toast(`${q.name} selesai · ${rp(svc(q.service).price)}`, "success");
+    save(); closeModal(); render({ keep: true }); toast(`${q.name} selesai · ${rp(qPrice(q))}`, "success");
   },
   clearDemo: () => { db.history = db.history.filter((h) => !h.demo); save(); render({ keep: true }); toast("Data contoh dihapus.", "success"); },
   resetQueue: () => confirmDanger("Kosongkan antrian?", "Semua antrean yang sedang menunggu atau dikerjakan akan dihapus.", () => { db.queue = []; db.mine = []; save(); render({ keep: true }); toast("Antrian dikosongkan.", "success"); }),
@@ -1313,12 +1361,19 @@ function confirmDanger(title, text, fn) {
   openModal(`<h2>${title}</h2><p class="sub">${text}</p><div class="acts two"><button class="btn btn-ghost" data-action="closeModal">Batal</button><button class="btn btn-danger" data-action="runDanger">Ya, lanjutkan</button></div>`, title);
 }
 actions.runDanger = () => { closeModal(); pendingDanger?.(); pendingDanger = null; };
+actions.forgetMe = () => { try { localStorage.removeItem("wber_profile"); } catch {} toast("Data tersimpan di perangkat ini sudah dihapus.", "success"); };
+// Keamanan: aksi pengelolaan hanya boleh dijalankan akun pemilik yang sudah masuk
+["call", "skip", "finish", "confirmFinish", "toggleAccepting", "editService", "delService", "confirmDelService", "clearDemo", "resetQueue", "resetAll", "runDanger", "exportCsv", "histFilter"].forEach((k) => {
+  const fn = actions[k];
+  actions[k] = (...a) => (isOwner() ? fn(...a) : toast("Fitur ini hanya untuk pemilik.", "error"));
+});
 
 function setStatus(id, status) {
   const q = db.queue.find((x) => x.id === id); if (!q) return;
   if (status === "working") {
     if (working().length >= db.settings.chairs) return toast(db.settings.chairs > 1 ? "Semua kursi sedang terpakai." : "Selesaikan pelanggan yang sedang dikerjakan dulu.", "error");
     q.status = "working"; q.startedAt = new Date().toISOString();
+    if (db.settings.autoWaCall && isOwner()) window.open(waLink(q.phone, `Halo ${q.name}, giliran Anda (${q.no}) sekarang! Silakan menuju kursi pangkas di ${ACTIVE_SHOP}.`), "_blank", "noopener");
   }
   save(); render({ keep: true });
 }
@@ -1331,7 +1386,7 @@ function openFinish(id) {
   const q = db.queue.find((x) => x.id === id); if (!q) return;
   const s = svc(q.service);
   openModal(`<h2>Selesaikan layanan</h2><p class="sub">${esc(q.no)} · ${esc(q.name)} — ${esc(s.name)}</p>
-    <div class="sum" style="margin-bottom:16px"><span>Total pembayaran</span><b style="font-size:1.2rem">${rp(s.price)}</b></div>
+    <div class="sum" style="margin-bottom:16px"><span>Total pembayaran${q.age === "Anak-anak" ? " (diskon anak)" : ""}</span><b style="font-size:1.2rem">${rp(qPrice(q))}</b></div>
     <div class="field"><span class="lbl">Metode pembayaran</span><div class="pills" role="radiogroup" aria-label="Metode pembayaran">${PAYMENTS.map((p, i) => `<label class="pill"><input type="radio" name="pay" value="${p}" ${i === 0 ? "checked" : ""}/><span>${p}</span></label>`).join("")}</div></div>
     <div class="acts two" style="margin-top:20px"><button class="btn btn-ghost" data-action="closeModal">Batal</button><button class="btn btn-primary" data-action="confirmFinish" data-id="${id}">${icon("check", 16)} Selesai</button></div>`, "Selesaikan layanan");
 }
@@ -1347,18 +1402,26 @@ function openCheckin(preSvc) {
   openModal(`<h2>${owner ? "Daftarkan pelanggan" : "Pelanggan melakukan check-in"}</h2><p class="sub">Isi data untuk mendapatkan nomor antrean.</p>
     <form class="form" data-form="checkin" novalidate>
       <div class="field"><label for="c-name">Nama pelanggan</label><input id="c-name" autocomplete="name" value="${owner ? "" : esc(prof.name || "")}" /><span class="err" data-err="name"></span></div>
-      <div class="row-2"><div class="field"><label for="c-age">Kategori umur</label><select id="c-age">${AGE_GROUPS.map((a) => `<option ${prof.age === a && !owner ? "selected" : ""}>${a}</option>`).join("")}</select></div>
+      <div class="row-2"><div class="field"><label for="c-age">Kategori umur</label><select id="c-age" data-change="svcsum">${AGE_GROUPS.map((a) => `<option ${prof.age === a && !owner ? "selected" : ""}>${a}</option>`).join("")}</select></div>
         <div class="field"><label for="c-svc">Pelayanan</label><select id="c-svc" data-change="svcsum">${db.services.map((s) => `<option value="${esc(s.id)}" ${s.id === preSvc ? "selected" : ""}>${esc(s.name)} (${rpK(s.price)})</option>`).join("")}</select></div></div>
       <div class="field"><label for="c-phone">No HP / WhatsApp</label><input id="c-phone" type="tel" inputmode="numeric" autocomplete="tel" placeholder="081234567890" value="${owner ? "" : esc(prof.phone || "")}" /><span class="err" data-err="phone"></span></div>
+      <div class="field"><label for="c-slot">Jam kedatangan</label><select id="c-slot" data-change="svcsum"></select><span class="hint" id="slot-hint"></span><span class="err" data-err="slot"></span></div>
       <div class="sum" id="svc-sum"></div>
+      <label class="check"><input type="checkbox" id="c-wa" ${owner ? "" : "checked"} /><span>${owner ? "Kirim tiket ke WhatsApp pelanggan" : "Kirim tiket ke WhatsApp saya"}</span></label>
+      ${owner ? "" : `<label class="check"><input type="checkbox" id="c-remember" checked /><span>Ingat nama &amp; no HP di perangkat ini</span></label>`}
+      <p class="hint">${icon("shield", 13)} Data Anda hanya dipakai untuk antrean dan notifikasi tiket. Pelanggan lain tidak dapat melihat nomor HP Anda.</p>
       <div class="acts two"><button class="btn btn-ghost" type="button" data-action="closeModal">Batal</button><button class="btn btn-primary" type="submit">Check-in</button></div>
     </form>`, "Check-in pelanggan");
   updateSvcSum();
 }
 function updateSvcSum() {
   const sel = $("#c-svc"); if (!sel) return;
-  const s = svc(sel.value), e = etaNew();
-  $("#svc-sum").innerHTML = `<span>${icon("clock", 15)} Estimasi mulai ${e ? "±" + e + " mnt" : "segera"} · durasi ${fmtDur(s.mins)}</span><b>${rp(s.price)}</b>`;
+  const s = svc(sel.value), e = etaNew(), disc = $("#c-age").value === "Anak-anak" ? CHILD_DISCOUNT : 0;
+  const slotSel = $("#c-slot"), keep = slotSel.value, opts = slotOptions(sel.value);
+  slotSel.innerHTML = `<option value="">Secepatnya (antri langsung)</option>` + opts.map((o) => `<option value="${o.hm}" ${o.full ? "disabled" : ""}>${o.hm}${o.full ? " (penuh)" : ""}</option>`).join("");
+  if (keep && opts.some((o) => o.hm === keep && !o.full)) slotSel.value = keep;
+  $("#slot-hint").textContent = opts.length ? "Pilih “Secepatnya” untuk antri langsung, atau tentukan jam hari ini." : "Tidak ada jam tersisa hari ini. Gunakan “Secepatnya” bila toko masih buka.";
+  $("#svc-sum").innerHTML = `<span>${icon("clock", 15)} Durasi ${fmtDur(s.mins)}${slotSel.value ? ` · jam ${slotSel.value}` : ` · mulai ${e ? "±" + e + " mnt" : "segera"}`}${disc ? ` · <b>diskon anak −${rp(disc)}</b>` : ""}</span><b>${rp(Math.max(0, s.price - disc))}</b>`;
 }
 document.addEventListener("change", (e) => { if (e.target.matches("[data-change=svcsum]")) updateSvcSum(); });
 
@@ -1403,12 +1466,24 @@ const forms = {
     if (db.queue.some((x) => x.phone === phone)) return setErr(form, { phone: "Nomor ini sudah ada di antrean." });
     if (!isOwner() && !db.settings.accepting) return toast("Antrian sedang ditutup.", "error");
     if (waiting().length >= db.settings.maxWaiting) return toast("Antrian penuh. Silakan coba lagi nanti.", "error");
-    const id = Date.now(), age = $("#c-age").value;
-    const q = { id, no: nextTicketNo(), name, age, service: $("#c-svc").value, phone, status: "waiting", createdAt: new Date().toISOString() };
+    const id = Date.now(), age = $("#c-age").value, slotHm = $("#c-slot").value, sid = $("#c-svc").value;
+    if (slotHm && !slotOptions(sid).some((o) => o.hm === slotHm && !o.full)) return setErr(form, { slot: "Jam ini sudah penuh atau terlewat. Pilih jam lain." });
+    const q = { id, no: nextTicketNo(), name, age, service: sid, phone, status: "waiting", createdAt: new Date().toISOString() };
+    if (slotHm) q.slot = hmToDate(slotHm).toISOString();
     db.queue.push(q);
-    if (!isOwner()) { db.mine.push(id); ls.set("wber_profile", { name, phone, age }); }
+    if (!isOwner()) {
+      db.mine.push(id);
+      if ($("#c-remember")?.checked) ls.set("wber_profile", { name, phone, age });
+      else { try { localStorage.removeItem("wber_profile"); } catch {} }
+    }
+    const sendWa = $("#c-wa")?.checked, href = waLink(phone, ticketText(q));
     save(); closeModal(); render({ keep: true });
-    toast(isOwner() ? `${name} masuk antrian (${q.no}).` : `Berhasil! Nomor antrean Anda ${q.no}.`, "success");
+    if (sendWa) window.open(href, "_blank", "noopener"); // membuka WhatsApp dengan pesan tiket siap kirim
+    openModal(`<div style="text-align:center"><div style="color:var(--gold-text);font-size:.74rem;letter-spacing:.16em;text-transform:uppercase;font-weight:600">Tiket berhasil dibuat</div>
+      <div style="font-family:var(--font-display);font-size:3.2rem;font-weight:800;line-height:1.15">${esc(q.no)}</div>
+      <p class="sub" style="margin:4px 0 2px">${esc(name)} · ${esc(svc(sid).name)}${q.slot ? ` · jadwal ${fmtTime(q.slot)}` : ""}</p>
+      <p class="sub">Biaya ${rp(qPrice(q))}${age === "Anak-anak" ? " (sudah termasuk diskon anak)" : ""}</p></div>
+      <div class="acts"><a class="btn btn-primary" target="_blank" rel="noopener" href="${href}">${icon("chat", 16)} ${sendWa ? "Kirim ulang tiket ke WhatsApp" : "Kirim tiket ke WhatsApp"}</a><button class="btn btn-ghost" data-action="closeModal">Tutup</button></div>`, "Tiket berhasil");
   },
   service(form) {
     const id = form.dataset.id, name = $("#v-name").value.trim(), price = Number($("#v-price").value), mins = Number($("#v-mins").value);
@@ -1421,7 +1496,7 @@ const forms = {
     const open = $("#s-open").value, close = $("#s-close").value, wa = $("#s-wa").value.replace(/[\s-]/g, "");
     if (setErr(form, { wa: wa && !phoneOk(wa) ? "Nomor WhatsApp tidak valid." : "" })) return;
     if (!open || !close || open >= close) return toast("Jam tutup harus setelah jam buka.", "error");
-    Object.assign(db.settings, { open, close, wa, chairs: Math.min(6, Math.max(1, Number($("#s-chairs").value) || 1)), maxWaiting: Math.min(99, Math.max(1, Number($("#s-max").value) || 15)) });
+    Object.assign(db.settings, { open, close, wa, chairs: Math.min(6, Math.max(1, Number($("#s-chairs").value) || 1)), maxWaiting: Math.min(99, Math.max(1, Number($("#s-max").value) || 15)), autoWaCall: $("#s-autowa").checked });
     save(); render({ keep: true }); toast("Pengaturan disimpan.", "success");
   },
   async password(form) {
@@ -1432,6 +1507,7 @@ const forms = {
   },
 };
 const lock = { fails: 0, until: 0 };
+["service", "settings", "password"].forEach((k) => { const fn = forms[k]; forms[k] = (...a) => (isOwner() ? fn(...a) : toast("Fitur ini hanya untuk pemilik.", "error")); });
 
 /* ===================== EKSPOR CSV ===================== */
 function exportCsv() {
